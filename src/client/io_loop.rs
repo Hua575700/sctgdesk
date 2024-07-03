@@ -41,7 +41,7 @@ use crate::client::{
     new_voice_call_request, Client, MediaData, MediaSender, QualityStatus, MILLI1, SEC30,
 };
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-use crate::common::{self, update_clipboard};
+use crate::clipboard::{update_clipboard, CLIPBOARD_INTERVAL};
 use crate::common::{get_default_sound_input, set_sound_input};
 use crate::ui_session_interface::{InvokeUiSession, Session};
 #[cfg(not(any(target_os = "ios")))]
@@ -1002,8 +1002,9 @@ impl<T: InvokeUiSession> Remote<T> {
         if limited_fps > custom_fps {
             limited_fps = custom_fps;
         }
+        let last_auto_fps = self.handler.lc.read().unwrap().last_auto_fps.clone();
         let should_decrease = (len > 1
-            && ctl.last_auto_fps.clone().unwrap_or(custom_fps as _) > limited_fps)
+            && last_auto_fps.clone().unwrap_or(custom_fps as _) > limited_fps)
             || len > std::cmp::max(1, limited_fps / 2);
 
         // increase judgement
@@ -1015,14 +1016,14 @@ impl<T: InvokeUiSession> Remote<T> {
             ctl.idle_counter = 0;
         }
         let mut should_increase = false;
-        if let Some(last_auto_fps) = ctl.last_auto_fps.clone() {
+        if let Some(last_auto_fps) = last_auto_fps.clone() {
             // ever set
             if last_auto_fps + 3 <= limited_fps && ctl.idle_counter > 3 {
                 // limited_fps is 3 larger than last set, and idle time is more than 3 seconds
                 should_increase = true;
             }
         }
-        if ctl.last_auto_fps.is_none() || should_decrease || should_increase {
+        if last_auto_fps.is_none() || should_decrease || should_increase {
             // limited_fps to ensure decoding is faster than encoding
             let mut auto_fps = limited_fps;
             if should_decrease && limited_fps < len {
@@ -1041,13 +1042,13 @@ impl<T: InvokeUiSession> Remote<T> {
             self.sender.send(Data::Message(msg)).ok();
             log::info!("Set fps to {}", auto_fps);
             ctl.last_queue_size = len;
-            ctl.last_auto_fps = Some(auto_fps);
+            self.handler.lc.write().unwrap().last_auto_fps = Some(auto_fps);
         }
         // send refresh
         for (display, video_queue) in self.video_queue_map.read().unwrap().iter() {
             let tolerable = std::cmp::min(decode_fps, video_queue.capacity() / 2);
             if ctl.refresh_times < 20 // enough
-                    && (len > tolerable
+                    && (video_queue.len() > tolerable
                             && (ctl.refresh_times == 0 || ctl.last_refresh_instant.elapsed().as_secs() > 10))
             {
                 // Refresh causes client set_display, left frames cause flickering.
@@ -1134,16 +1135,16 @@ impl<T: InvokeUiSession> Remote<T> {
                             // To make sure current text clipboard data is updated.
                             #[cfg(not(any(target_os = "android", target_os = "ios")))]
                             if let Some(mut rx) = rx {
-                                timeout(common::CLIPBOARD_INTERVAL, rx.recv()).await.ok();
+                                timeout(CLIPBOARD_INTERVAL, rx.recv()).await.ok();
                             }
 
                             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                            if let Some(msg_out) = Client::get_current_text_clipboard_msg() {
+                            if let Some(msg_out) = Client::get_current_clipboard_msg() {
                                 let sender = self.sender.clone();
                                 let permission_config = self.handler.get_permission_config();
                                 tokio::spawn(async move {
                                     // due to clipboard service interval time
-                                    sleep(common::CLIPBOARD_INTERVAL as f32 / 1_000.).await;
+                                    sleep(CLIPBOARD_INTERVAL as f32 / 1_000.).await;
                                     if permission_config.is_text_clipboard_required() {
                                         sender.send(Data::Message(msg_out)).ok();
                                     }
@@ -1179,7 +1180,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 Some(message::Union::Clipboard(cb)) => {
                     if !self.handler.lc.read().unwrap().disable_clipboard.v {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                        update_clipboard(cb, Some(&crate::client::get_old_clipboard_text()));
+                        update_clipboard(cb, Some(crate::client::get_old_clipboard_text()));
                         #[cfg(any(target_os = "android", target_os = "ios"))]
                         {
                             let content = if cb.compress {
@@ -1858,7 +1859,6 @@ struct FpsControl {
     last_queue_size: usize,
     refresh_times: usize,
     last_refresh_instant: Instant,
-    last_auto_fps: Option<usize>,
     idle_counter: usize,
     last_active_time: HashMap<usize, Instant>,
 }
@@ -1869,7 +1869,6 @@ impl Default for FpsControl {
             last_queue_size: Default::default(),
             refresh_times: Default::default(),
             last_refresh_instant: Instant::now(),
-            last_auto_fps: Default::default(),
             idle_counter: 0,
             last_active_time: Default::default(),
         }
